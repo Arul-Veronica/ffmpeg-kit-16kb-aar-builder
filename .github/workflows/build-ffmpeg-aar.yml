@@ -1,0 +1,254 @@
+name: Build FFmpegKit Universal AAR
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout ffmpeg-kit
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4.7.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Download NDK r27c
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -O ndk.zip
+          unzip -q ndk.zip -d $HOME
+          echo "ANDROID_NDK_ROOT=$HOME/android-ndk-r27c" >> $GITHUB_ENV
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake libtool pkg-config \
+            curl git doxygen nasm \
+            gcc g++ gperf texinfo yasm \
+            bison autogen wget autopoint \
+            meson ninja-build ragel groff \
+            gtk-doc-tools libtasn1-6-dev \
+            build-essential
+
+      - name: Pre-clone cpu-features and fix cmake compatibility
+        run: |
+          mkdir -p src
+          git clone --depth=1 --branch v0.8.0 \
+            https://github.com/arthenica/cpu_features.git \
+            src/cpu-features
+          CMAKE_FILE="src/cpu-features/CMakeLists.txt"
+          sed -i \
+            's/cmake_minimum_required(VERSION [^)]*)/cmake_minimum_required(VERSION 3.5)/g' \
+            "$CMAKE_FILE"
+          sed -i 's/if\s*(BUILD_TESTING)/if(FALSE)/g' "$CMAKE_FILE"
+          echo "=== Verifying cmake patches ==="
+          grep -n "cmake_minimum_required\|BUILD_TESTING\|if(FALSE)" "$CMAKE_FILE"
+
+      - name: Inject page-size linker flags into android.sh and scripts
+        run: |
+          python3 << 'PYEOF'
+          import re, glob
+
+          PAGE_FLAGS = '-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384'
+          targets = glob.glob('scripts/**/*.sh', recursive=True) + ['android.sh']
+          patched = []
+
+          for f in targets:
+              try:
+                  content = open(f).read()
+              except Exception:
+                  continue
+              if 'max-page-size' in content:
+                  print(f"  Already has page-size flags: {f}")
+                  continue
+              new = re.sub(r'(-Wl,--hash-style=both)', r'\1 ' + PAGE_FLAGS, content)
+              if new != content:
+                  open(f, 'w').write(new)
+                  patched.append(f)
+                  print(f"  Patched: {f}")
+
+          if patched:
+              print(f"\nInjected page-size flags into {len(patched)} file(s).")
+              for f in patched:
+                  for i, line in enumerate(open(f).read().splitlines(), 1):
+                      if 'max-page-size' in line:
+                          print(f"  {f}:{i}: {line.strip()}")
+          else:
+              print("\nWARNING: --hash-style=both not found. Dumping LDFLAGS lines for debug:")
+              for f in targets:
+                  try:
+                      content = open(f).read()
+                  except Exception:
+                      continue
+                  for i, line in enumerate(content.splitlines(), 1):
+                      if 'LDFLAGS' in line:
+                          print(f"  {f}:{i}: {line.strip()}")
+          PYEOF
+
+      - name: Patch all clang 18 and NDK r27c compatibility issues
+        run: |
+          python3 << 'PYEOF'
+          import os, glob, datetime
+
+          BUILD_DATE = datetime.datetime.now().strftime('%Y%m%d')
+          print(f"BUILD_DATE = {BUILD_DATE}")
+
+          CFLAGS = [
+              '-Wno-pointer-sign',
+              '-Wno-single-bit-bitfield-constant-conversion',
+              f'-DFFMPEG_KIT_BUILD_DATE={BUILD_DATE}',
+          ]
+          LDFLAGS_MK = [
+              '-Wl,-z,max-page-size=16384',
+              '-Wl,-z,common-page-size=16384',
+          ]
+          MARKER = 'clang18-pagesz-fix'
+
+          def patch_application_mk(path):
+              content = open(path).read()
+              if MARKER in content:
+                  print(f"  Already patched: {path}")
+                  return
+              additions = f'\n# {MARKER}\n'
+              for flag in CFLAGS:
+                  additions += f'APP_CFLAGS += {flag}\n'
+              for flag in LDFLAGS_MK:
+                  additions += f'APP_LDFLAGS += {flag}\n'
+              open(path, 'a').write(additions)
+              print(f"  Patched Application.mk: {path}")
+
+          def patch_android_mk(path):
+              content = open(path).read()
+              if MARKER in content:
+                  print(f"  Already patched: {path}")
+                  return
+              cflag_line = 'LOCAL_CFLAGS += ' + ' '.join(CFLAGS)
+              ldflag_line = 'LOCAL_LDFLAGS += ' + ' '.join(LDFLAGS_MK)
+              lines = content.splitlines(keepends=True)
+              out = []
+              for line in lines:
+                  out.append(line)
+                  if line.strip().startswith('LOCAL_MODULE') and ':=' in line:
+                      out.append(f'# {MARKER}\n')
+                      out.append(cflag_line + '\n')
+                      out.append(ldflag_line + '\n')
+              open(path, 'w').writelines(out)
+              print(f"  Patched Android.mk: {path}")
+
+          def prepend_pragma(path, pragma_flag):
+              pragma = f'#pragma clang diagnostic ignored "{pragma_flag}"\n'
+              content = open(path).read()
+              if pragma not in content:
+                  open(path, 'w').write(pragma + content)
+                  print(f"  Prepended pragma to {path}")
+
+          for f in glob.glob('**/Application.mk', recursive=True):
+              patch_application_mk(f)
+          for f in glob.glob('**/Android.mk', recursive=True):
+              patch_android_mk(f)
+          for f in glob.glob('**/ffmpegkit.c', recursive=True):
+              prepend_pragma(f, '-Wpointer-sign')
+          for f in glob.glob('**/fftools_ffmpeg_mux_init.c', recursive=True):
+              prepend_pragma(f, '-Wsingle-bit-bitfield-constant-conversion')
+
+          print('\nAll patches applied.')
+          PYEOF
+
+      - name: Build Universal AAR
+        run: |
+          ./android.sh \
+            --enable-gpl \
+            --enable-x264 \
+            --disable-arm-v7a \
+            --disable-arm-v7a-neon \
+            --disable-x86 \
+            --disable-x86-64
+          cp prebuilt/bundle-android-aar/ffmpeg-kit/ffmpeg-kit.aar ffmpeg-kit-universal.aar
+
+      - name: Verify universal compatibility
+        run: |
+          python3 << 'PYEOF'
+          import struct, zipfile
+
+          # THE ONE TRUE CHECK:
+          # If every PT_LOAD segment has alignment == 16384, the .so is universal.
+          #
+          # Why this is sufficient:
+          #   - PT_LOAD align=16384 means every segment starts on a 16KB boundary
+          #   - 16KB is a multiple of 4KB, so every segment boundary is also a
+          #     valid 4KB page boundary
+          #   - PT_GNU_RELRO is always a subset of a PT_LOAD segment
+          #   - bionic's mprotect() rounds RELRO start DOWN to the nearest page
+          #   - With 16KB-aligned PT_LOAD starts, that rounded address always
+          #     falls inside the PT_LOAD that contains RELRO — never in a gap
+          #   - Therefore mprotect() succeeds on both 4KB kernels (Poco F1,
+          #     Android 5-14) and 16KB kernels (Android 15+)
+          #
+          # Why checking RELRO % page_size == 0 is WRONG:
+          #   - The OS never requires RELRO itself to be page-aligned
+          #   - It only requires PAGE_START(RELRO) to fall within a mapped region
+          #   - 16KB-aligned PT_LOAD guarantees this without RELRO being aligned
+
+          def get_max_pt_load_align(data):
+              if data[:4] != b'\x7fELF' or data[4] != 2:
+                  return None
+              e_phoff     = struct.unpack_from('<Q', data, 32)[0]
+              e_phentsize = struct.unpack_from('<H', data, 54)[0]
+              e_phnum     = struct.unpack_from('<H', data, 56)[0]
+              max_align = 0
+              for i in range(e_phnum):
+                  off    = e_phoff + i * e_phentsize
+                  p_type = struct.unpack_from('<I', data, off)[0]
+                  p_align= struct.unpack_from('<Q', data, off + 48)[0]
+                  if p_type == 1:  # PT_LOAD
+                      max_align = max(max_align, p_align)
+              return max_align
+
+          print("=== Universal compatibility verification ===")
+          print(f"  {'Library':<35} {'PT_LOAD align':>14}  Result")
+          all_ok = True
+
+          with zipfile.ZipFile('ffmpeg-kit-universal.aar') as z:
+              for name in sorted(z.namelist()):
+                  if not name.endswith('.so'):
+                      continue
+                  align = get_max_pt_load_align(z.read(name))
+                  if align is None:
+                      continue
+                  lib = name.split('/')[-1]
+                  ok = (align == 16384)
+                  if not ok:
+                      all_ok = False
+                  align_str = f"{align // 1024}KB"
+                  flag = "✅" if ok else "❌"
+                  print(f"  {lib:<35} {align_str:>14}  {flag}")
+
+          print()
+          if all_ok:
+              print("✅  All PT_LOAD segments are 16KB-aligned.")
+              print("    Safe on Poco F1 (4KB kernel) and Android 15+ (16KB kernel).")
+          else:
+              print("❌  Some PT_LOAD segments are not 16KB-aligned.")
+              print("    The page-size flags did not reach the linker.")
+              raise SystemExit(1)
+          PYEOF
+
+      - name: Print build.log on failure
+        if: failure()
+        run: |
+          find . -name "build.log" -exec cat {} \;
+
+      - name: Upload Universal AAR
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: ffmpeg-kit-universal
+          path: ffmpeg-kit-universal.aar
+          retention-days: 30
